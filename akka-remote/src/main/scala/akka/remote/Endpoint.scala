@@ -15,8 +15,9 @@ import akka.remote.transport.AssociationHandle._
 import akka.remote.transport.{ AkkaPduCodec, Transport, AssociationHandle }
 import akka.serialization.Serialization
 import akka.util.ByteString
-import scala.util.control.{ NoStackTrace, NonFatal }
 import akka.remote.transport.Transport.InvalidAssociationException
+import java.io.NotSerializableException
+import scala.util.control.{ NoStackTrace, NonFatal }
 
 /**
  * INTERNAL API
@@ -143,6 +144,12 @@ private[remote] class EndpointAssociationException(msg: String, cause: Throwable
 /**
  * INTERNAL API
  */
+@SerialVersionUID(1L)
+private[remote] class OversizedPayloadException(msg: String) extends EndpointException(msg)
+
+/**
+ * INTERNAL API
+ */
 private[remote] class EndpointWriter(
   handleOrActive: Option[AssociationHandle],
   val localAddress: Address,
@@ -167,10 +174,14 @@ private[remote] class EndpointWriter(
 
   var inbound = handle.isDefined
 
-  private def publishAndThrow(reason: Throwable): Nothing = {
+  private def publish(reason: Throwable): Unit = {
     try
       eventPublisher.notifyListeners(AssociationErrorEvent(reason, localAddress, remoteAddress, inbound))
     catch { case NonFatal(e) ⇒ log.error(e, "Unable to publish error event to EventStream.") }
+  }
+
+  private def publishAndThrow(reason: Throwable): Nothing = {
+    publish(reason)
     throw reason
   }
 
@@ -226,6 +237,8 @@ private[remote] class EndpointWriter(
         handle match {
           case Some(h) ⇒
             val pdu = codec.constructMessage(recipient.localAddressToUse, recipient, serializeMessage(msg), senderOption)
+            if (pdu.size > transport.maximumPayloadBytes)
+              throw new OversizedPayloadException(s"Payload size ${pdu.size} exceeded maximum ${transport.maximumPayloadBytes}")
             if (h.write(pdu)) stay() else {
               stash()
               goto(Buffering)
@@ -234,11 +247,12 @@ private[remote] class EndpointWriter(
             throw new EndpointException("Internal error: Endpoint is in state Writing, but no association handle is present.")
         }
       } catch {
-        case NonFatal(e: EndpointException) ⇒ publishAndThrow(e)
-        case NonFatal(e)                    ⇒ publishAndThrow(new EndpointException("Failed to write message to the transport", e))
+        case e @ (_: OversizedPayloadException | _: NotSerializableException) ⇒ { publish(e); stay() }
+        case e: EndpointException ⇒ publishAndThrow(e)
+        case NonFatal(e) ⇒ publishAndThrow(new EndpointException("Failed to write message to the transport", e))
       }
 
-    // We are in Writing state, so stash is emtpy, safe to stop here
+    // We are in Writing state, so stash is empty, safe to stop here
     case Event(FlushAndStop, _) ⇒ stop()
   }
 
@@ -301,8 +315,6 @@ private[remote] class EndpointWriter(
   }
 
   private def serializeMessage(msg: Any): MessageProtocol = handle match {
-    // FIXME: Unserializable messages should be dropped without closing the association. Should be logged,
-    // but without flooding the log.
     case Some(h) ⇒
       Serialization.currentTransportAddress.withValue(h.localAddress) {
         (MessageSerializer.serialize(extendedSystem, msg.asInstanceOf[AnyRef]))

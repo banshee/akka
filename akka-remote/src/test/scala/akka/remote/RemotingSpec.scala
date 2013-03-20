@@ -139,6 +139,26 @@ class RemotingSpec extends AkkaSpec(RemotingSpec.cfg) with ImplicitSender with D
 
   val here = system.actorFor("akka.test://remote-sys@localhost:12346/user/echo")
 
+  def verifySend(msg: Any)(afterSend: ⇒ Unit) {
+    val eventForwarder = system.actorOf(Props(new Actor {
+      def receive = {
+        case x ⇒ testActor ! x
+      }
+    }))
+    system.eventStream.subscribe(eventForwarder, classOf[AssociationErrorEvent])
+    system.eventStream.subscribe(eventForwarder, classOf[DisassociatedEvent])
+    try {
+      here ! msg
+      afterSend
+      expectNoMsg()
+    } finally {
+      system.eventStream.unsubscribe(eventForwarder, classOf[AssociationErrorEvent])
+      system.eventStream.unsubscribe(eventForwarder, classOf[DisassociatedEvent])
+    }
+  }
+
+  val maxPayloadBytes = conf.getBytes("akka.remote.test.maximum-payload-bytes").toInt
+
   override def afterTermination() {
     otherSystem.shutdown()
     AssociationRegistry.clear()
@@ -343,6 +363,28 @@ class RemotingSpec extends AkkaSpec(RemotingSpec.cfg) with ImplicitSender with D
       expectMsg(42)
       system.stop(r)
       expectMsg("postStop")
+    }
+
+    "drop unserializable messages" in {
+      object Unserializable
+      verifySend(Unserializable) {
+        expectMsgType[AssociationErrorEvent]
+      }
+    }
+
+    "allow messages up to payload size" in {
+      val maxProtocolOverhead = 500 // Make sure we're still under size after the message is serialized, etc
+      val big = Array.fill(maxPayloadBytes - maxProtocolOverhead)(42: Byte)
+      verifySend(big) {
+        // We don't expect any errors
+      }
+    }
+
+    "drop messages over payload size" in {
+      val oversized = Array.fill(maxPayloadBytes + 1)(42: Byte)
+      verifySend(oversized) {
+        expectMsgType[AssociationErrorEvent]
+      }
     }
 
   }
